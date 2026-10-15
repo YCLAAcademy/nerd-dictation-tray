@@ -3,6 +3,8 @@
 A system tray icon for [nerd-dictation](https://github.com/ideasman42/nerd-dictation),
 the offline VOSK-based voice typing tool for Linux.
 
+![Tray icon with its right-click menu](screenshot.png)
+
 - **Right-click** the icon: Start dictation, Stop dictation, Settings…, Exit
 - **Left-click** the icon: toggle dictation on/off
 - **Global shortcuts** (default `Super+Alt+D` to start, `Super+Alt+S` to stop)
