@@ -31,6 +31,9 @@ except (ValueError, ImportError):
     XApp = None
 
 APP_NAME = "nerd-dictation-tray"
+ABOUT_AUTHOR = "YCLA Academy"
+ABOUT_URL = "https://github.com/YCLAAcademy/nerd-dictation-tray"
+UPSTREAM_URL = "https://github.com/ideasman42/nerd-dictation"
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "nerd-dictation")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "tray.json")
 AUTOSTART_FILE = os.path.join(os.path.expanduser("~"), ".config", "autostart", APP_NAME + ".desktop")
@@ -97,11 +100,15 @@ def first_existing(*paths):
 
 DEFAULT_CONFIG = {
     "nerd_dictation": find_nerd_dictation(),
-    "shortcut_begin": "<Super><Alt>d",
-    "shortcut_end": "<Super><Alt>s",
+    # Same key for both: Ctrl+Alt+D toggles dictation on/off.
+    "shortcut_begin": "<Control><Alt>d",
+    "shortcut_end": "<Control><Alt>d",
     "model_dir": default_model_dir(),
     "input": "PAREC",
     "noise_suppression": True,
+    "mic_level": 100,  # Volume (%) of the noise-suppressed dictation mic.
+    "ignore_words_enabled": True,
+    "ignore_words": "the, a, uh, um, huh, hmm",
     "sounds": True,
     "sound_begin": first_existing(
         "/usr/share/sounds/LinuxMint/stereo/button-toggle-on.ogg",
@@ -148,6 +155,10 @@ def noise_suppressed_source_ready():
         'aec_args="noise_suppression=1 high_pass_filter=1 analog_gain_control=0 digital_gain_control=0"',
     )
     return result is not None and result.returncode == 0
+
+
+def set_noise_suppressed_level(percent):
+    pactl("set-source-volume", NS_SOURCE, "{:d}%".format(int(percent)))
 
 
 def remove_noise_suppressed_source():
@@ -270,137 +281,208 @@ class SettingsDialog(Gtk.Dialog):
     def __init__(self, app):
         super().__init__(title="Nerd Dictation Settings", flags=0)
         self.app = app
-        self.set_default_size(460, -1)
+        self.set_default_size(520, -1)
         self.set_icon_name("audio-input-microphone")
+
+        reset = Gtk.Button(label="Reset to defaults")
+        reset.set_tooltip_text("Fill in the default values. Nothing changes until you click Save.")
+        reset.connect("clicked", lambda _b: self.load(DEFAULT_CONFIG))
+        self.get_action_area().pack_start(reset, False, False, 0)
+        self.get_action_area().set_child_secondary(reset, True)
         self.add_button("Cancel", Gtk.ResponseType.CANCEL)
         self.add_button("Save", Gtk.ResponseType.OK)
         self.set_default_response(Gtk.ResponseType.OK)
 
-        cfg = app.config
-        grid = Gtk.Grid(column_spacing=12, row_spacing=10, margin=16)
-        self.get_content_area().add(grid)
+        notebook = Gtk.Notebook(margin=8)
+        self.get_content_area().add(notebook)
+        notebook.append_page(self._page_general(), Gtk.Label(label="General"))
+        notebook.append_page(self._page_noise(), Gtk.Label(label="Noise"))
+        notebook.append_page(self._page_sounds(), Gtk.Label(label="Sounds"))
+        notebook.append_page(self._page_about(), Gtk.Label(label="About"))
 
-        row = 0
+        self.load(app.config)
+        self.autostart_check.set_active(autostart_enabled())
+        self.show_all()
 
-        def label(text):
-            lbl = Gtk.Label(label=text, xalign=0)
-            return lbl
+    # ---- Layout helpers ----
 
-        grid.attach(label("<b>Keyboard shortcuts</b>"), 0, row, 2, 1)
-        grid.get_child_at(0, row).set_use_markup(True)
+    @staticmethod
+    def _grid():
+        return Gtk.Grid(column_spacing=12, row_spacing=10, margin=16)
+
+    @staticmethod
+    def _label(text, markup=False, dim=False, wrap=False):
+        lbl = Gtk.Label(xalign=0)
+        if markup:
+            lbl.set_markup(text)
+        else:
+            lbl.set_text(text)
+        if dim:
+            lbl.get_style_context().add_class("dim-label")
+        if wrap:
+            lbl.set_line_wrap(True)
+            lbl.set_max_width_chars(60)
+        return lbl
+
+    # ---- Pages ----
+
+    def _page_general(self):
+        grid, row = self._grid(), 0
+        grid.attach(self._label("<b>Keyboard shortcuts</b>", markup=True), 0, row, 2, 1)
         row += 1
 
-        self.begin_btn = ShortcutButton(cfg["shortcut_begin"], app.unbind_shortcuts, lambda: None)
+        self.begin_btn = ShortcutButton("", self.app.unbind_shortcuts, lambda: None)
         self.begin_btn.set_hexpand(True)
-        grid.attach(label("Start dictation:"), 0, row, 1, 1)
+        grid.attach(self._label("Start dictation:"), 0, row, 1, 1)
         grid.attach(self.begin_btn, 1, row, 1, 1)
         row += 1
 
-        self.end_btn = ShortcutButton(cfg["shortcut_end"], app.unbind_shortcuts, lambda: None)
-        grid.attach(label("Stop dictation:"), 0, row, 1, 1)
+        self.end_btn = ShortcutButton("", self.app.unbind_shortcuts, lambda: None)
+        grid.attach(self._label("Stop dictation:"), 0, row, 1, 1)
         grid.attach(self.end_btn, 1, row, 1, 1)
         row += 1
 
-        hint = label("Click a button, then press the key combination.")
-        hint.get_style_context().add_class("dim-label")
-        grid.attach(hint, 0, row, 2, 1)
+        grid.attach(self._label(
+            "Click a button, then press the keys. Use the same keys for both to toggle.", dim=True), 0, row, 2, 1)
         row += 1
 
         grid.attach(Gtk.Separator(), 0, row, 2, 1)
         row += 1
-
-        grid.attach(label("<b>Dictation</b>"), 0, row, 2, 1)
-        grid.get_child_at(0, row).set_use_markup(True)
+        grid.attach(self._label("<b>Dictation</b>", markup=True), 0, row, 2, 1)
         row += 1
 
         self.script_chooser = Gtk.FileChooserButton(
             title="Choose the nerd-dictation script", action=Gtk.FileChooserAction.OPEN
         )
-        if cfg["nerd_dictation"] and os.path.isfile(cfg["nerd_dictation"]):
-            self.script_chooser.set_filename(cfg["nerd_dictation"])
-        grid.attach(label("nerd-dictation:"), 0, row, 1, 1)
+        grid.attach(self._label("nerd-dictation:"), 0, row, 1, 1)
         grid.attach(self.script_chooser, 1, row, 1, 1)
         row += 1
 
         self.model_chooser = Gtk.FileChooserButton(
             title="Choose a VOSK model folder", action=Gtk.FileChooserAction.SELECT_FOLDER
         )
-        if cfg["model_dir"] and os.path.isdir(cfg["model_dir"]):
-            self.model_chooser.set_filename(cfg["model_dir"])
-        else:
-            self.model_chooser.set_current_folder(CONFIG_DIR)
         model_box = Gtk.Box(spacing=6)
         model_box.pack_start(self.model_chooser, True, True, 0)
-        reset_btn = Gtk.Button.new_from_icon_name("edit-clear-symbolic", Gtk.IconSize.BUTTON)
-        reset_btn.set_tooltip_text("Use the default model (~/.config/nerd-dictation/model)")
-        reset_btn.connect("clicked", lambda _b: self.model_chooser.unselect_all())
-        model_box.pack_start(reset_btn, False, False, 0)
-        grid.attach(label("Model folder:"), 0, row, 1, 1)
+        clear_btn = Gtk.Button.new_from_icon_name("edit-clear-symbolic", Gtk.IconSize.BUTTON)
+        clear_btn.set_tooltip_text("Use the default model (~/.config/nerd-dictation/model)")
+        clear_btn.connect("clicked", lambda _b: self.model_chooser.unselect_all())
+        model_box.pack_start(clear_btn, False, False, 0)
+        grid.attach(self._label("Model folder:"), 0, row, 1, 1)
         grid.attach(model_box, 1, row, 1, 1)
         row += 1
 
         self.input_combo = Gtk.ComboBoxText()
         for value in ("PAREC", "PW-CAT", "SOX"):
             self.input_combo.append(value, value.lower())
-        self.input_combo.set_active_id(cfg["input"])
-        grid.attach(label("Audio input:"), 0, row, 1, 1)
+        grid.attach(self._label("Audio input:"), 0, row, 1, 1)
         grid.attach(self.input_combo, 1, row, 1, 1)
         row += 1
 
-        self.noise_check = Gtk.CheckButton(label="Noise suppression (removes background noise and breathing)")
-        self.noise_check.set_tooltip_text(
-            "Uses a WebRTC-filtered copy of your default mic, for dictation only.\n"
-            "Other apps keep using the normal mic. Works with the parec audio input.")
-        self.noise_check.set_active(cfg["noise_suppression"])
+        grid.attach(Gtk.Separator(), 0, row, 2, 1)
+        row += 1
+        self.autostart_check = Gtk.CheckButton(label="Start this tray app when I log in")
+        grid.attach(self.autostart_check, 0, row, 2, 1)
+        return grid
+
+    def _page_noise(self):
+        grid, row = self._grid(), 0
+        grid.attach(self._label("<b>Noise suppression</b>", markup=True), 0, row, 2, 1)
+        row += 1
+
+        self.noise_check = Gtk.CheckButton(label="Filter the mic for dictation (other apps keep the normal mic)")
         grid.attach(self.noise_check, 0, row, 2, 1)
         row += 1
 
+        grid.attach(self._label(
+            "Uses WebRTC noise suppression and a low-rumble (high-pass) filter. Auto-gain is off, "
+            "since it boosts background noise. WebRTC has no strength setting, it's on or off. "
+            "Works with the parec audio input.", dim=True, wrap=True), 0, row, 2, 1)
+        row += 1
+
+        self.level_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 30, 150, 5)
+        self.level_scale.set_hexpand(True)
+        self.level_scale.set_value_pos(Gtk.PositionType.RIGHT)
+        self.level_scale.connect("format-value", lambda _s, v: "{:d}%".format(int(v)))
+        self.level_scale.add_mark(100, Gtk.PositionType.BOTTOM, None)
+        # Applied live while dictating, so you can hear/see the effect.
+        self.level_scale.connect("value-changed", lambda s: set_noise_suppressed_level(s.get_value()))
+        grid.attach(self._label("Dictation mic level:"), 0, row, 1, 1)
+        grid.attach(self.level_scale, 1, row, 1, 1)
+        row += 1
+        grid.attach(self._label(
+            "Lower it if quiet sounds like breathing still get typed, raise it if your voice is missed.",
+            dim=True, wrap=True), 0, row, 2, 1)
+        row += 1
+
+        for widget in (self.level_scale,):
+            self.noise_check.bind_property("active", widget, "sensitive", 2)  # SYNC_CREATE
+
         grid.attach(Gtk.Separator(), 0, row, 2, 1)
         row += 1
-
-        grid.attach(label("<b>Sounds</b>"), 0, row, 2, 1)
-        grid.get_child_at(0, row).set_use_markup(True)
+        grid.attach(self._label("<b>Stray words</b>", markup=True), 0, row, 2, 1)
         row += 1
 
-        self.sounds_check = Gtk.CheckButton(label="Play a sound when dictation starts and stops")
-        self.sounds_check.set_active(cfg["sounds"])
+        self.ignore_check = Gtk.CheckButton(label="Ignore stray words picked up from noise")
+        grid.attach(self.ignore_check, 0, row, 2, 1)
+        row += 1
+
+        self.ignore_entry = Gtk.Entry()
+        self.ignore_entry.set_hexpand(True)
+        grid.attach(self._label("Words:"), 0, row, 1, 1)
+        grid.attach(self.ignore_entry, 1, row, 1, 1)
+        row += 1
+        grid.attach(self._label(
+            "When nothing but these words is heard (like a lone \"the\" after a breath), it's dropped. "
+            "The same words inside normal sentences are still typed.", dim=True, wrap=True), 0, row, 2, 1)
+
+        self.ignore_check.bind_property("active", self.ignore_entry, "sensitive", 2)  # SYNC_CREATE
+        return grid
+
+    def _page_sounds(self):
+        grid, row = self._grid(), 0
+        self.sounds_check = Gtk.CheckButton(label="Play a sound when dictation is ready and when it has stopped")
         grid.attach(self.sounds_check, 0, row, 2, 1)
         row += 1
 
-        self.sound_begin_chooser = self._sound_chooser(cfg["sound_begin"])
-        grid.attach(label("Start sound:"), 0, row, 1, 1)
+        self.sound_begin_chooser = self._sound_chooser()
+        grid.attach(self._label("Start sound:"), 0, row, 1, 1)
         grid.attach(self._with_play_button(self.sound_begin_chooser), 1, row, 1, 1)
         row += 1
 
-        self.sound_end_chooser = self._sound_chooser(cfg["sound_end"])
-        grid.attach(label("Stop sound:"), 0, row, 1, 1)
+        self.sound_end_chooser = self._sound_chooser()
+        grid.attach(self._label("Stop sound:"), 0, row, 1, 1)
         grid.attach(self._with_play_button(self.sound_end_chooser), 1, row, 1, 1)
-        row += 1
 
         for widget in (self.sound_begin_chooser, self.sound_end_chooser):
             self.sounds_check.bind_property("active", widget, "sensitive", 2)  # SYNC_CREATE
+        return grid
 
-        grid.attach(Gtk.Separator(), 0, row, 2, 1)
-        row += 1
+    def _page_about(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin=24)
+        icon = Gtk.Image.new_from_icon_name("audio-input-microphone", Gtk.IconSize.DIALOG)
+        box.pack_start(icon, False, False, 0)
+        box.pack_start(self._label("<big><b>Nerd Dictation Tray</b></big>", markup=True), False, False, 0)
+        box.pack_start(self._label("Offline voice typing from your system tray."), False, False, 0)
+        box.pack_start(self._label("Created by <b>{:s}</b>".format(ABOUT_AUTHOR), markup=True), False, False, 8)
+        box.pack_start(Gtk.LinkButton.new_with_label(ABOUT_URL, ABOUT_URL), False, False, 0)
+        box.pack_start(self._label(
+            "Built on nerd-dictation by Campbell Barton (ideasman42), using the VOSK speech engine.",
+            dim=True, wrap=True), False, False, 8)
+        box.pack_start(Gtk.LinkButton.new_with_label(UPSTREAM_URL, UPSTREAM_URL), False, False, 0)
+        for child in box.get_children():
+            child.set_halign(Gtk.Align.CENTER)
+        return box
 
-        self.autostart_check = Gtk.CheckButton(label="Start this tray app when I log in")
-        self.autostart_check.set_active(autostart_enabled())
-        grid.attach(self.autostart_check, 0, row, 2, 1)
-
-        self.show_all()
+    # ---- Sound widgets ----
 
     @staticmethod
-    def _sound_chooser(path):
+    def _sound_chooser():
         chooser = Gtk.FileChooserButton(title="Choose a sound", action=Gtk.FileChooserAction.OPEN)
         sound_filter = Gtk.FileFilter()
         sound_filter.set_name("Sounds")
         for pattern in ("*.oga", "*.ogg", "*.wav", "*.flac", "*.mp3"):
             sound_filter.add_pattern(pattern)
         chooser.add_filter(sound_filter)
-        if path and os.path.isfile(path):
-            chooser.set_filename(path)
-        else:
-            chooser.set_current_folder("/usr/share/sounds")
         return chooser
 
     @staticmethod
@@ -413,6 +495,33 @@ class SettingsDialog(Gtk.Dialog):
         box.pack_start(play, False, False, 0)
         return box
 
+    # ---- Values ----
+
+    @staticmethod
+    def _set_file(chooser, path, fallback_dir):
+        chooser.unselect_all()
+        if path and os.path.exists(path):
+            chooser.set_filename(path)
+        else:
+            chooser.set_current_folder(fallback_dir)
+
+    def load(self, cfg):
+        """Fill the form from a config (the saved one, or DEFAULT_CONFIG for a reset)."""
+        self.begin_btn.accel = cfg["shortcut_begin"]
+        self.begin_btn.set_label(accel_label(cfg["shortcut_begin"]))
+        self.end_btn.accel = cfg["shortcut_end"]
+        self.end_btn.set_label(accel_label(cfg["shortcut_end"]))
+        self._set_file(self.script_chooser, cfg["nerd_dictation"], os.path.expanduser("~"))
+        self._set_file(self.model_chooser, cfg["model_dir"], CONFIG_DIR)
+        self.input_combo.set_active_id(cfg["input"])
+        self.noise_check.set_active(cfg["noise_suppression"])
+        self.level_scale.set_value(cfg["mic_level"])
+        self.ignore_check.set_active(cfg["ignore_words_enabled"])
+        self.ignore_entry.set_text(cfg["ignore_words"])
+        self.sounds_check.set_active(cfg["sounds"])
+        self._set_file(self.sound_begin_chooser, cfg["sound_begin"], "/usr/share/sounds")
+        self._set_file(self.sound_end_chooser, cfg["sound_end"], "/usr/share/sounds")
+
     def collect(self):
         return {
             "nerd_dictation": self.script_chooser.get_filename() or self.app.config["nerd_dictation"],
@@ -421,6 +530,9 @@ class SettingsDialog(Gtk.Dialog):
             "model_dir": self.model_chooser.get_filename() or "",
             "input": self.input_combo.get_active_id() or "PAREC",
             "noise_suppression": self.noise_check.get_active(),
+            "mic_level": int(self.level_scale.get_value()),
+            "ignore_words_enabled": self.ignore_check.get_active(),
+            "ignore_words": self.ignore_entry.get_text().strip(),
             "sounds": self.sounds_check.get_active(),
             "sound_begin": self.sound_begin_chooser.get_filename() or "",
             "sound_end": self.sound_end_chooser.get_filename() or "",
@@ -535,8 +647,12 @@ class TrayApp:
         model = self.config.get("model_dir")
         if model and os.path.isdir(model):
             cmd.append("--vosk-model-dir=" + model)
+        words = self.config.get("ignore_words", "").strip()
+        if self.config.get("ignore_words_enabled") and words:
+            cmd.append("--ignore-words=" + words)
         if self.config.get("noise_suppression") and self.config["input"] == "PAREC":
             if noise_suppressed_source_ready():
+                set_noise_suppressed_level(self.config["mic_level"])
                 cmd.append("--pulse-device-name=" + NS_SOURCE)
             else:
                 sys.stderr.write("Noise suppression unavailable, using the normal mic.\n")
@@ -646,6 +762,9 @@ class TrayApp:
             set_autostart(dialog.autostart_check.get_active())
             if not self.config["noise_suppression"] and not self.is_running():
                 remove_noise_suppressed_source()
+        else:
+            # The level slider applies live, put back the saved level.
+            set_noise_suppressed_level(self.config["mic_level"])
         dialog.destroy()
         self.settings_dialog = None
         self.bind_shortcuts()

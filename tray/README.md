@@ -8,7 +8,7 @@ the offline VOSK-based voice typing tool for Linux.
 - **Right-click** the icon: Start dictation, Stop dictation, Settings…, Exit
 - **Left-click** the icon: toggle dictation on/off
 - The icon turns **green** while dictating, and a sound plays on start/stop
-- **Global shortcuts** (default `Super+Alt+D` to start, `Super+Alt+S` to stop)
+- **Global shortcut** (default `Ctrl+Alt+D` toggles dictation on/off)
 
 ## Requirements
 
@@ -29,6 +29,7 @@ The tray app uses the `nerd-dictation` script at the root of this repository
 
 ## Settings
 
+Settings has General, Noise, Sounds and About tabs, plus **Reset to defaults** (fills in the defaults; nothing changes until you click Save).
 Stored in `~/.config/nerd-dictation/tray.json`:
 
 | Setting | Description |
@@ -38,5 +39,7 @@ Stored in `~/.config/nerd-dictation/tray.json`:
 | Model folder | VOSK model to use (empty = `~/.config/nerd-dictation/model`) |
 | Audio input | `parec`, `pw-cat` or `sox` |
 | Noise suppression | Dictate through a WebRTC-filtered copy of the default mic ("Dictation Mic", PulseAudio `module-echo-cancel`) that removes background noise and breathing. Other apps keep the normal mic. `parec` input only. |
+| Dictation mic level | Volume (30–150%) of the filtered mic only, applied live. Lower it if breathing still gets typed. |
+| Stray words | Drop utterances made up only of these words (default `the, a, uh, um, huh, hmm`), which VOSK often hears in noise. Uses nerd-dictation's `--ignore-words`. |
 | Sounds | Play a sound when dictation is ready and when it has fully stopped; pick and preview the files |
 | Start on login | Adds/removes `~/.config/autostart/nerd-dictation-tray.desktop` |

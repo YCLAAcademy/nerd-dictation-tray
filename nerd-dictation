@@ -971,6 +971,7 @@ def text_from_vosk_pipe(
     suspend_on_start: bool = False,
     verbose: int = 0,
     vosk_grammar_file: str = "",
+    ignore_words: str = "",
 ) -> bool:
     # Delay some imports until recording has started to avoid minor delays.
     import json
@@ -1092,6 +1093,9 @@ def text_from_vosk_pipe(
     # -----------------------------------------------
     # Utilities for accessing results on `rec` (VOSK)
 
+    # Utterances made up only of these words are dropped, they're typically noise (breathing, clicks).
+    ignore_words_set = {w for w in ignore_words.replace(",", " ").lower().split()}
+
     def rec_handle_fn_wrapper_from_final_result() -> str:
         json_text = rec.FinalResult()
 
@@ -1105,6 +1109,10 @@ def text_from_vosk_pipe(
         json_data = json.loads(json_text)
         text = json_data["text"]
         assert isinstance(text, str)
+        if text and ignore_words_set and set(text.split()) <= ignore_words_set:
+            if verbose >= 1:
+                sys.stderr.write("Ignored: {:s}\n".format(text))
+            text = ""
         if text:
             handle_fn_wrapper(text, False)
         return json_text
@@ -1320,6 +1328,7 @@ def main_begin(
     suspend_on_start: bool = False,
     verbose: int = 0,
     vosk_grammar_file: str = "",
+    ignore_words: str = "",
 ) -> None:
     """
     Initialize audio recording, then full text to speech conversion can take place.
@@ -1496,6 +1505,7 @@ def main_begin(
         suspend_on_start=suspend_on_start,
         verbose=verbose,
         vosk_grammar_file=vosk_grammar_file,
+        ignore_words=ignore_words,
     )
 
     if not found_any:
@@ -1622,6 +1632,20 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             "Path to a JSON grammar file.  This restricts the phrases recognized by VOSK for\n"
             "better accuracy.  See `vosk_recognizer_new_grm` in the API reference:\n"
             "https://github.com/alphacep/vosk-api/blob/master/src/vosk_api.h"
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--ignore-words",
+        default=None,
+        dest="ignore_words",
+        type=str,
+        metavar="WORDS",
+        help=(
+            "Comma separated words, an utterance made up of only these words is ignored.\n"
+            "Useful to drop words VOSK detects in background noise, e.g. \"the,uh,um\".\n"
+            "Has no effect on progressive (partial) output."
         ),
         required=False,
     )
@@ -1905,6 +1929,7 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             suspend_on_start=args.suspend_on_start,
             verbose=args.verbose,
             vosk_grammar_file=args.vosk_grammar_file,
+            ignore_words=args.ignore_words or "",
         ),
     )
 
