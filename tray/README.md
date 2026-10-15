@@ -37,4 +37,6 @@ Stored in `~/.config/nerd-dictation/tray.json`:
 | nerd-dictation | Path to the `nerd-dictation` script |
 | Model folder | VOSK model to use (empty = `~/.config/nerd-dictation/model`) |
 | Audio input | `parec`, `pw-cat` or `sox` |
+| Noise suppression | Dictate through a WebRTC-filtered copy of the default mic ("Dictation Mic", PulseAudio `module-echo-cancel`) that removes background noise and breathing. Other apps keep the normal mic. `parec` input only. |
+| Sounds | Play a sound when dictation is ready and when it has fully stopped; pick and preview the files |
 | Start on login | Adds/removes `~/.config/autostart/nerd-dictation-tray.desktop` |

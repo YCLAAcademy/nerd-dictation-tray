@@ -101,6 +101,7 @@ DEFAULT_CONFIG = {
     "shortcut_end": "<Super><Alt>s",
     "model_dir": default_model_dir(),
     "input": "PAREC",
+    "noise_suppression": True,
     "sounds": True,
     "sound_begin": first_existing(
         "/usr/share/sounds/LinuxMint/stereo/button-toggle-on.ogg",
@@ -111,6 +112,52 @@ DEFAULT_CONFIG = {
         "/usr/share/sounds/freedesktop/stereo/device-removed.oga",
     ),
 }
+
+
+# A PulseAudio virtual mic with WebRTC noise suppression, used only for dictation.
+NS_SOURCE = "dictation_mic"
+NS_SINK = "dictation_mic_ref"  # Unused echo-cancel reference sink the module requires.
+
+
+def pactl(*args):
+    try:
+        return subprocess.run(["pactl", *args], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def noise_suppressed_source_ready():
+    """Create the noise-suppressed mic if needed (on top of the default mic). Return True if usable."""
+    sources = pactl("list", "sources", "short")
+    if sources is None:
+        return False
+    if any(line.split("\t")[1:2] == [NS_SOURCE] for line in sources.stdout.splitlines()):
+        return True
+    master = pactl("get-default-source")
+    if master is None or master.returncode != 0 or not master.stdout.strip():
+        return False
+    result = pactl(
+        "load-module", "module-echo-cancel",
+        "source_master=" + master.stdout.strip(),
+        "source_name=" + NS_SOURCE,
+        "sink_name=" + NS_SINK,
+        "aec_method=webrtc",
+        "source_properties=\"device.description='Dictation Mic (noise suppressed)'\"",
+        "sink_properties=\"device.description='Dictation Mic reference'\"",
+        # Auto-gain is off: it boosts quiet background noise back up.
+        'aec_args="noise_suppression=1 high_pass_filter=1 analog_gain_control=0 digital_gain_control=0"',
+    )
+    return result is not None and result.returncode == 0
+
+
+def remove_noise_suppressed_source():
+    modules = pactl("list", "modules", "short")
+    if modules is None:
+        return
+    for line in modules.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) >= 3 and fields[1] == "module-echo-cancel" and "source_name=" + NS_SOURCE in fields[2]:
+            pactl("unload-module", fields[0])
 
 
 def play_sound(path):
@@ -300,6 +347,14 @@ class SettingsDialog(Gtk.Dialog):
         grid.attach(self.input_combo, 1, row, 1, 1)
         row += 1
 
+        self.noise_check = Gtk.CheckButton(label="Noise suppression (removes background noise and breathing)")
+        self.noise_check.set_tooltip_text(
+            "Uses a WebRTC-filtered copy of your default mic, for dictation only.\n"
+            "Other apps keep using the normal mic. Works with the parec audio input.")
+        self.noise_check.set_active(cfg["noise_suppression"])
+        grid.attach(self.noise_check, 0, row, 2, 1)
+        row += 1
+
         grid.attach(Gtk.Separator(), 0, row, 2, 1)
         row += 1
 
@@ -365,6 +420,7 @@ class SettingsDialog(Gtk.Dialog):
             "shortcut_end": self.end_btn.accel,
             "model_dir": self.model_chooser.get_filename() or "",
             "input": self.input_combo.get_active_id() or "PAREC",
+            "noise_suppression": self.noise_check.get_active(),
             "sounds": self.sounds_check.get_active(),
             "sound_begin": self.sound_begin_chooser.get_filename() or "",
             "sound_end": self.sound_end_chooser.get_filename() or "",
@@ -479,6 +535,11 @@ class TrayApp:
         model = self.config.get("model_dir")
         if model and os.path.isdir(model):
             cmd.append("--vosk-model-dir=" + model)
+        if self.config.get("noise_suppression") and self.config["input"] == "PAREC":
+            if noise_suppressed_source_ready():
+                cmd.append("--pulse-device-name=" + NS_SOURCE)
+            else:
+                sys.stderr.write("Noise suppression unavailable, using the normal mic.\n")
         try:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
         except OSError as ex:
@@ -583,6 +644,8 @@ class TrayApp:
             self.config.update(dialog.collect())
             save_config(self.config)
             set_autostart(dialog.autostart_check.get_active())
+            if not self.config["noise_suppression"] and not self.is_running():
+                remove_noise_suppressed_source()
         dialog.destroy()
         self.settings_dialog = None
         self.bind_shortcuts()
@@ -599,6 +662,7 @@ class TrayApp:
         if self.is_running():
             self.end()
         self.unbind_shortcuts()
+        remove_noise_suppressed_source()
         Gtk.main_quit()
 
 
