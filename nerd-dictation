@@ -19,6 +19,7 @@ import time
 
 # Types.
 from typing import (
+    Any,
     Dict,
     IO,
     List,
@@ -955,6 +956,20 @@ def recording_proc_with_non_blocking_stdout(
     return ps, stdout
 
 
+def whisper_engine_module() -> ModuleType:
+    """Load ``nerd_dictation_whisper.py`` from next to this script."""
+    import importlib.util
+
+    filepath = os.path.join(os.path.dirname(os.path.realpath(__file__)), "nerd_dictation_whisper.py")
+    spec = importlib.util.spec_from_file_location("nerd_dictation_whisper", filepath)
+    if spec is None or spec.loader is None or not os.path.exists(filepath):
+        sys.stderr.write("The Whisper engine needs {!r} (next to nerd-dictation).\n".format(filepath))
+        sys.exit(1)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def text_from_vosk_pipe(
     *,
     vosk_model_dir: str,
@@ -972,11 +987,13 @@ def text_from_vosk_pipe(
     verbose: int = 0,
     vosk_grammar_file: str = "",
     ignore_words: str = "",
+    engine: str = "VOSK",
+    whisper_options: Optional[Dict[str, Any]] = None,
 ) -> bool:
     # Delay some imports until recording has started to avoid minor delays.
     import json
 
-    if not os.path.exists(vosk_model_dir):
+    if engine == "VOSK" and not os.path.exists(vosk_model_dir):
         sys.stderr.write(
             "Please download the model from "
             "https://alphacephei.com/vosk/models and unpack it to {!r}.\n".format(vosk_model_dir)
@@ -992,26 +1009,31 @@ def text_from_vosk_pipe(
         ps, stdout = recording_proc_start()
         has_ps = True
 
-    # `mypy` doesn't know about VOSK.
-    import vosk  # type: ignore
-
-    vosk.SetLogLevel(-1)
-
-    if not vosk_grammar_file:
-        grammar_json = ""
-    else:
-        with open(vosk_grammar_file, encoding="utf-8") as fh:
-            grammar_json = fh.read()
-
     # Allow for loading the model to take some time:
     if verbose >= 1:
         sys.stderr.write("Loading model...\n")
-    model = vosk.Model(vosk_model_dir)
 
-    if grammar_json == "":
-        rec = vosk.KaldiRecognizer(model, sample_rate)
+    if engine == "WHISPER":
+        # Has the same interface as `vosk.KaldiRecognizer`, see `nerd_dictation_whisper.py`.
+        rec = whisper_engine_module().WhisperRecognizer(sample_rate, verbose=verbose, **(whisper_options or {}))
     else:
-        rec = vosk.KaldiRecognizer(model, sample_rate, grammar_json)
+        # `mypy` doesn't know about VOSK.
+        import vosk  # type: ignore
+
+        vosk.SetLogLevel(-1)
+
+        if not vosk_grammar_file:
+            grammar_json = ""
+        else:
+            with open(vosk_grammar_file, encoding="utf-8") as fh:
+                grammar_json = fh.read()
+
+        model = vosk.Model(vosk_model_dir)
+
+        if grammar_json == "":
+            rec = vosk.KaldiRecognizer(model, sample_rate)
+        else:
+            rec = vosk.KaldiRecognizer(model, sample_rate, grammar_json)
 
     if verbose >= 1:
         sys.stderr.write("Model loaded.\n")
@@ -1109,7 +1131,7 @@ def text_from_vosk_pipe(
         json_data = json.loads(json_text)
         text = json_data["text"]
         assert isinstance(text, str)
-        if text and ignore_words_set and set(text.split()) <= ignore_words_set:
+        if text and ignore_words_set and {w.strip(".,!?;:\"'") for w in text.lower().split()} <= ignore_words_set:
             if verbose >= 1:
                 sys.stderr.write("Ignored: {:s}\n".format(text))
             text = ""
@@ -1329,6 +1351,8 @@ def main_begin(
     verbose: int = 0,
     vosk_grammar_file: str = "",
     ignore_words: str = "",
+    engine: str = "VOSK",
+    whisper_options: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
     Initialize audio recording, then full text to speech conversion can take place.
@@ -1506,6 +1530,8 @@ def main_begin(
         verbose=verbose,
         vosk_grammar_file=vosk_grammar_file,
         ignore_words=ignore_words,
+        engine=engine,
+        whisper_options=whisper_options,
     )
 
     if not found_any:
@@ -1623,6 +1649,75 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
     )
 
     subparse.add_argument(
+        "--engine",
+        dest="engine",
+        default="VOSK",
+        choices=("VOSK", "WHISPER"),
+        metavar="ENGINE",
+        help=(
+            "Speech recognition engine.\n"
+            "\n"
+            "- ``VOSK`` (default) types word by word as you speak.\n"
+            "- ``WHISPER`` (faster-whisper) is more accurate and adds punctuation,\n"
+            "  it types each sentence after you pause. Needs: pip install faster-whisper"
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-model",
+        dest="whisper_model",
+        default="large-v3-turbo",
+        type=str,
+        metavar="NAME_OR_DIR",
+        help=(
+            "Whisper model name (downloaded once, e.g. large-v3-turbo, medium, small, base)\n"
+            "or the path to a converted model folder. Defaults to large-v3-turbo."
+        ),
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-device",
+        dest="whisper_device",
+        default="auto",
+        choices=("auto", "cuda", "cpu"),
+        metavar="DEVICE",
+        help="Run Whisper on: auto (GPU when available, default), cuda or cpu.",
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-compute-type",
+        dest="whisper_compute_type",
+        default="default",
+        type=str,
+        metavar="TYPE",
+        help="Whisper precision, e.g. float16, int8_float16, int8 (smaller and faster), default.",
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-language",
+        dest="whisper_language",
+        default="",
+        type=str,
+        metavar="CODE",
+        help="Language code for Whisper (e.g. en, de), detected automatically when empty.",
+        required=False,
+    )
+
+    subparse.add_argument(
+        "--whisper-pause",
+        dest="whisper_pause",
+        default=0.6,
+        type=float,
+        metavar="SECONDS",
+        help="Silence (in seconds) that ends a sentence, which is then typed. Defaults to 0.6.",
+        required=False,
+    )
+
+    subparse.add_argument(
         "--vosk-grammar-file",
         default=None,
         dest="vosk_grammar_file",
@@ -1666,10 +1761,10 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
     subparse.add_argument(
         "--sample-rate",
         dest="sample_rate",
-        default=44100,
+        default=None,
         type=int,
         metavar="HZ",
-        help=("The sample rate to use for recording (in Hz).\n" "Defaults to 44100."),
+        help=("The sample rate to use for recording (in Hz).\n" "Defaults to 44100 (16000 for the Whisper engine)."),
         required=False,
     )
 
@@ -1910,7 +2005,7 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             path_to_cookie=args.path_to_cookie,
             vosk_model_dir=args.vosk_model_dir,
             pulse_device_name=args.pulse_device_name,
-            sample_rate=args.sample_rate,
+            sample_rate=args.sample_rate or (16000 if args.engine == "WHISPER" else 44100),
             input_method=args.input_method,
             progressive=not (args.defer_output or args.output == "STDOUT"),
             progressive_continuous=args.progressive_continuous,
@@ -1930,6 +2025,14 @@ def argparse_create_begin(subparsers: "argparse._SubParsersAction[argparse.Argum
             verbose=args.verbose,
             vosk_grammar_file=args.vosk_grammar_file,
             ignore_words=args.ignore_words or "",
+            engine=args.engine,
+            whisper_options=dict(
+                model=args.whisper_model,
+                device=args.whisper_device,
+                compute_type=args.whisper_compute_type,
+                language=args.whisper_language,
+                pause=args.whisper_pause,
+            ),
         ),
     )
 

@@ -137,6 +137,24 @@ To test dictation:
 If you prefer to use a package, see: `Packaging <package/readme.rst>`_.
 
 
+Whisper Engine (Optional)
+-------------------------
+
+``--engine=WHISPER`` uses `faster-whisper <https://github.com/SYSTRAN/faster-whisper>`__ instead of VOSK.
+It's much more accurate and adds punctuation and capitals, but it types each sentence when you pause
+(``--whisper-pause``, default 0.6 seconds) rather than word by word. It runs on an NVIDIA GPU when available.
+
+.. code-block:: sh
+
+   pip3 install faster-whisper
+   ./nerd-dictation begin --engine=WHISPER --whisper-language=en &
+   # Start speaking.
+   ./nerd-dictation end
+
+The model (``--whisper-model``, default ``large-v3-turbo``, 1.6 GB) is downloaded on first use,
+after that it works offline. The engine lives in ``nerd_dictation_whisper.py``, keep it next to ``nerd-dictation``.
+
+
 Tray App
 ========
 
@@ -214,7 +232,13 @@ Subcommand: ``begin``
 usage::
 
        nerd-dictation begin [-h] [--cookie FILE_PATH] [--config FILE]
-                            [--vosk-model-dir DIR] [--vosk-grammar-file DIR]
+                            [--vosk-model-dir DIR] [--engine ENGINE]
+                            [--whisper-model NAME_OR_DIR]
+                            [--whisper-device DEVICE]
+                            [--whisper-compute-type TYPE]
+                            [--whisper-language CODE]
+                            [--whisper-pause SECONDS]
+                            [--vosk-grammar-file DIR] [--ignore-words WORDS]
                             [--pulse-device-name IDENTIFIER]
                             [--sample-rate HZ] [--defer-output] [--continuous]
                             [--timeout SECONDS] [--idle-time SECONDS]
@@ -236,15 +260,34 @@ options:
   --config FILE         Override the file used for the user configuration.
                         Use an empty string to prevent the users configuration being read.
   --vosk-model-dir DIR  Path to the VOSK model, see: https://alphacephei.com/vosk/models
+  --engine ENGINE       Speech recognition engine.
+
+                        - ``VOSK`` (default) types word by word as you speak.
+                        - ``WHISPER`` (faster-whisper) is more accurate and adds punctuation,
+                          it types each sentence after you pause. Needs: pip install faster-whisper
+  --whisper-model NAME_OR_DIR
+                        Whisper model name (downloaded once, e.g. large-v3-turbo, medium, small, base)
+                        or the path to a converted model folder. Defaults to large-v3-turbo.
+  --whisper-device DEVICE
+                        Run Whisper on: auto (GPU when available, default), cuda or cpu.
+  --whisper-compute-type TYPE
+                        Whisper precision, e.g. float16, int8_float16, int8 (smaller and faster), default.
+  --whisper-language CODE
+                        Language code for Whisper (e.g. en, de), detected automatically when empty.
+  --whisper-pause SECONDS
+                        Silence (in seconds) that ends a sentence, which is then typed. Defaults to 0.6.
   --vosk-grammar-file DIR
                         Path to a JSON grammar file.  This restricts the phrases recognized by VOSK for
                         better accuracy.  See `vosk_recognizer_new_grm` in the API reference:
                         https://github.com/alphacep/vosk-api/blob/master/src/vosk_api.h
+  --ignore-words WORDS  Comma separated words, an utterance made up of only these words is ignored.
+                        Useful to drop words VOSK detects in background noise, e.g. "the,uh,um".
+                        Has no effect on progressive (partial) output.
   --pulse-device-name IDENTIFIER
                         The name of the pulse-audio device to use for recording.
                         See the output of "pactl list sources" to find device names (using the identifier following "Name:").
   --sample-rate HZ      The sample rate to use for recording (in Hz).
-                        Defaults to 44100.
+                        Defaults to 44100 (16000 for the Whisper engine).
   --defer-output        When enabled, output is deferred until exiting.
 
                         This prevents text being typed during speech (implied with ``--output=STDOUT``)

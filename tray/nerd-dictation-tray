@@ -6,7 +6,8 @@ Right-click the tray icon for Start / Stop / Settings / Exit.
 Global keyboard shortcuts for begin/end can be set in Settings (X11 only).
 
 Uses the system Python (for GTK bindings) to run the tray, and runs
-nerd-dictation itself with the Python interpreter that has `vosk` installed.
+nerd-dictation itself with the Python interpreter that has `vosk` installed
+(and `faster-whisper`, for the optional Whisper engine).
 """
 
 import json
@@ -109,6 +110,12 @@ DEFAULT_CONFIG = {
     "mic_level": 100,  # Volume (%) of the noise-suppressed dictation mic.
     "ignore_words_enabled": True,
     "ignore_words": "the, a, uh, um, huh, hmm",
+    # Optional Whisper engine (faster-whisper) instead of VOSK.
+    "whisper_enabled": False,
+    "whisper_model": "large-v3-turbo",
+    "whisper_device": "auto",
+    "whisper_language": "",
+    "whisper_pause": 0.6,
     "sounds": True,
     "sound_begin": first_existing(
         "/usr/share/sounds/LinuxMint/stereo/button-toggle-on.ogg",
@@ -296,6 +303,7 @@ class SettingsDialog(Gtk.Dialog):
         notebook = Gtk.Notebook(margin=8)
         self.get_content_area().add(notebook)
         notebook.append_page(self._page_general(), Gtk.Label(label="General"))
+        notebook.append_page(self._page_engine(), Gtk.Label(label="Speech engine"))
         notebook.append_page(self._page_noise(), Gtk.Label(label="Noise"))
         notebook.append_page(self._page_sounds(), Gtk.Label(label="Sounds"))
         notebook.append_page(self._page_about(), Gtk.Label(label="About"))
@@ -384,6 +392,64 @@ class SettingsDialog(Gtk.Dialog):
         grid.attach(self.autostart_check, 0, row, 2, 1)
         return grid
 
+    def _page_engine(self):
+        grid, row = self._grid(), 0
+        grid.attach(self._label("<b>Whisper</b>", markup=True), 0, row, 2, 1)
+        row += 1
+
+        self.whisper_check = Gtk.CheckButton(label="Use Whisper instead of VOSK")
+        grid.attach(self.whisper_check, 0, row, 2, 1)
+        row += 1
+
+        grid.attach(self._label(
+            "Whisper is much more accurate and adds punctuation and capitals. It types each sentence "
+            "when you pause, instead of word by word. Needs faster-whisper (pip install faster-whisper). "
+            "The model is downloaded on first use, then it works offline.", dim=True, wrap=True), 0, row, 2, 1)
+        row += 1
+
+        self.whisper_model_combo = Gtk.ComboBoxText.new_with_entry()
+        for name in ("large-v3-turbo", "large-v3", "distil-large-v3", "medium", "small", "base"):
+            self.whisper_model_combo.append_text(name)
+        self.whisper_model_combo.set_tooltip_text(
+            "large-v3-turbo: best balance (1.6 GB). distil-large-v3: English only, faster. "
+            "small/base: light, for the CPU. You can also type a model folder path.")
+        grid.attach(self._label("Model:"), 0, row, 1, 1)
+        grid.attach(self.whisper_model_combo, 1, row, 1, 1)
+        row += 1
+
+        self.whisper_device_combo = Gtk.ComboBoxText()
+        for value, label in (("auto", "Auto (GPU when available)"), ("cuda", "GPU (NVIDIA)"),
+                             ("cpu", "CPU (saves battery, use a small model)")):
+            self.whisper_device_combo.append(value, label)
+        grid.attach(self._label("Run on:"), 0, row, 1, 1)
+        grid.attach(self.whisper_device_combo, 1, row, 1, 1)
+        row += 1
+
+        self.whisper_language_combo = Gtk.ComboBoxText()
+        for value, label in (("", "Detect automatically"), ("en", "English"), ("hi", "Hindi"),
+                             ("es", "Spanish"), ("fr", "French"), ("de", "German"), ("it", "Italian"),
+                             ("pt", "Portuguese"), ("zh", "Chinese"), ("ja", "Japanese")):
+            self.whisper_language_combo.append(value, label)
+        grid.attach(self._label("Language:"), 0, row, 1, 1)
+        grid.attach(self.whisper_language_combo, 1, row, 1, 1)
+        row += 1
+
+        self.whisper_pause_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.3, 2.0, 0.1)
+        self.whisper_pause_scale.set_hexpand(True)
+        self.whisper_pause_scale.set_value_pos(Gtk.PositionType.RIGHT)
+        self.whisper_pause_scale.connect("format-value", lambda _s, v: "{:.1f} s".format(v))
+        grid.attach(self._label("Pause before typing:"), 0, row, 1, 1)
+        grid.attach(self.whisper_pause_scale, 1, row, 1, 1)
+        row += 1
+        grid.attach(self._label(
+            "How long a silence ends a sentence. Raise it if sentences get split while you think.",
+            dim=True, wrap=True), 0, row, 2, 1)
+
+        for widget in (self.whisper_model_combo, self.whisper_device_combo,
+                       self.whisper_language_combo, self.whisper_pause_scale):
+            self.whisper_check.bind_property("active", widget, "sensitive", 2)  # SYNC_CREATE
+        return grid
+
     def _page_noise(self):
         grid, row = self._grid(), 0
         grid.attach(self._label("<b>Noise suppression</b>", markup=True), 0, row, 2, 1)
@@ -466,7 +532,8 @@ class SettingsDialog(Gtk.Dialog):
         box.pack_start(self._label("Created by <b>{:s}</b>".format(ABOUT_AUTHOR), markup=True), False, False, 8)
         box.pack_start(Gtk.LinkButton.new_with_label(ABOUT_URL, ABOUT_URL), False, False, 0)
         box.pack_start(self._label(
-            "Built on nerd-dictation by Campbell Barton (ideasman42), using the VOSK speech engine.",
+            "Built on nerd-dictation by Campbell Barton (ideasman42), "
+            "using the VOSK or Whisper (faster-whisper) speech engines.",
             dim=True, wrap=True), False, False, 8)
         box.pack_start(Gtk.LinkButton.new_with_label(UPSTREAM_URL, UPSTREAM_URL), False, False, 0)
         for child in box.get_children():
@@ -518,6 +585,11 @@ class SettingsDialog(Gtk.Dialog):
         self.level_scale.set_value(cfg["mic_level"])
         self.ignore_check.set_active(cfg["ignore_words_enabled"])
         self.ignore_entry.set_text(cfg["ignore_words"])
+        self.whisper_check.set_active(cfg["whisper_enabled"])
+        self.whisper_model_combo.get_child().set_text(cfg["whisper_model"])
+        self.whisper_device_combo.set_active_id(cfg["whisper_device"])
+        self.whisper_language_combo.set_active_id(cfg["whisper_language"])
+        self.whisper_pause_scale.set_value(cfg["whisper_pause"])
         self.sounds_check.set_active(cfg["sounds"])
         self._set_file(self.sound_begin_chooser, cfg["sound_begin"], "/usr/share/sounds")
         self._set_file(self.sound_end_chooser, cfg["sound_end"], "/usr/share/sounds")
@@ -533,6 +605,11 @@ class SettingsDialog(Gtk.Dialog):
             "mic_level": int(self.level_scale.get_value()),
             "ignore_words_enabled": self.ignore_check.get_active(),
             "ignore_words": self.ignore_entry.get_text().strip(),
+            "whisper_enabled": self.whisper_check.get_active(),
+            "whisper_model": self.whisper_model_combo.get_child().get_text().strip() or "large-v3-turbo",
+            "whisper_device": self.whisper_device_combo.get_active_id() or "auto",
+            "whisper_language": self.whisper_language_combo.get_active_id() or "",
+            "whisper_pause": round(self.whisper_pause_scale.get_value(), 1),
             "sounds": self.sounds_check.get_active(),
             "sound_begin": self.sound_begin_chooser.get_filename() or "",
             "sound_end": self.sound_end_chooser.get_filename() or "",
@@ -644,9 +721,18 @@ class TrayApp:
             return
         # `--verbose=1` makes nerd-dictation report "Model loaded." once it's listening.
         cmd = [self.python, script, "begin", "--verbose=1", "--input=" + self.config["input"]]
-        model = self.config.get("model_dir")
-        if model and os.path.isdir(model):
-            cmd.append("--vosk-model-dir=" + model)
+        if self.config.get("whisper_enabled"):
+            cmd += [
+                "--engine=WHISPER",
+                "--whisper-model=" + self.config["whisper_model"],
+                "--whisper-device=" + self.config["whisper_device"],
+                "--whisper-language=" + self.config["whisper_language"],
+                "--whisper-pause={:.1f}".format(self.config["whisper_pause"]),
+            ]
+        else:
+            model = self.config.get("model_dir")
+            if model and os.path.isdir(model):
+                cmd.append("--vosk-model-dir=" + model)
         words = self.config.get("ignore_words", "").strip()
         if self.config.get("ignore_words_enabled") and words:
             cmd.append("--ignore-words=" + words)
