@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 
 import gi
 
@@ -36,6 +37,21 @@ AUTOSTART_FILE = os.path.join(os.path.expanduser("~"), ".config", "autostart", A
 
 ICON_IDLE = "microphone-sensitivity-muted-symbolic"
 ICON_ACTIVE = "microphone-sensitivity-high-symbolic"
+COOKIE_FILE = os.path.join(tempfile.gettempdir(), "nerd-dictation.cookie")
+
+
+def running_dictation_pid():
+    """Return the PID of a running nerd-dictation (from any launcher), otherwise None."""
+    try:
+        with open(COOKIE_FILE, encoding="utf-8") as fh:
+            pid = int(fh.read())
+        with open("/proc/{:d}/cmdline".format(pid), "rb") as fh:
+            cmdline = fh.read()
+    except (OSError, ValueError):
+        return None
+    if any(os.path.basename(arg) == b"nerd-dictation" for arg in cmdline.split(b"\0")):
+        return pid
+    return None
 
 
 def find_vosk_python():
@@ -290,6 +306,7 @@ class TrayApp:
         Keybinder.init()
         self.bind_shortcuts()
         self.update_state()
+        GLib.timeout_add_seconds(1, self._poll)
 
     # ---- Tray icon ----
 
@@ -324,6 +341,7 @@ class TrayApp:
 
     def update_state(self):
         running = self.is_running()
+        self._last_running = running
         self.item_start.set_sensitive(not running)
         self.item_stop.set_sensitive(running)
         if running:
@@ -336,7 +354,15 @@ class TrayApp:
     # ---- Dictation control ----
 
     def is_running(self):
-        return self.proc is not None and self.proc.poll() is None
+        if self.proc is not None and self.proc.poll() is None:
+            return True
+        # Also started elsewhere, e.g. from a terminal.
+        return running_dictation_pid() is not None
+
+    def _poll(self):
+        if self.is_running() != self._last_running:
+            self.update_state()
+        return True
 
     def begin(self):
         if self.is_running():

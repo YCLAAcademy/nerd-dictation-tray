@@ -91,6 +91,36 @@ def file_remove_if_exists(filepath: str) -> bool:
         return False
 
 
+def cookie_running_pid(path_to_cookie: str) -> Optional[int]:
+    """
+    Return the PID stored in the cookie if that nerd-dictation process is still running, otherwise None.
+
+    The cookie is kept after dictation ends, so the PID it contains may be stale.
+    """
+    try:
+        with open(path_to_cookie, "r", encoding="utf-8") as fh:
+            pid = int(fh.read())
+    except (OSError, ValueError):
+        return None
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        pass  # Exists, owned by another user.
+
+    # Guard against the PID having been reused by an unrelated process.
+    try:
+        with open("/proc/{:d}/cmdline".format(pid), "rb") as fh:
+            cmdline = fh.read()
+    except OSError:
+        return pid
+    if not any(os.path.basename(arg) == b"nerd-dictation" for arg in cmdline.split(b"\0")):
+        return None
+    return pid
+
+
 def file_handle_make_non_blocking(file_handle: IO[bytes]) -> None:
     import fcntl
 
@@ -1310,6 +1340,15 @@ def main_begin(
     if not path_to_cookie:
         path_to_cookie = os.path.join(tempfile.gettempdir(), TEMP_COOKIE_NAME)
 
+    running_pid = cookie_running_pid(path_to_cookie)
+    if running_pid is not None:
+        sys.stderr.write(
+            "nerd-dictation is already running (PID {:d}), "
+            'use "end" or "cancel" to stop it first.\n'.format(running_pid)
+        )
+        sys.exit(1)
+    del running_pid
+
     is_run_on = False
     if punctuate_from_previous_timeout > 0.0:
         age_in_seconds: Optional[float] = None
@@ -1474,7 +1513,8 @@ def main_end(
         path_to_cookie = os.path.join(tempfile.gettempdir(), TEMP_COOKIE_NAME)
 
     # Resume (does nothing if not suspended), so suspending doesn't prevent the cancel operation.
-    main_suspend(path_to_cookie=path_to_cookie, suspend=False, verbose=0)
+    if not main_suspend(path_to_cookie=path_to_cookie, suspend=False, verbose=0):
+        sys.exit(1)
 
     touch(path_to_cookie)
 
@@ -1487,7 +1527,8 @@ def main_cancel(
         path_to_cookie = os.path.join(tempfile.gettempdir(), TEMP_COOKIE_NAME)
 
     # Resume (does nothing if not suspended), so suspending doesn't prevent the cancel operation.
-    main_suspend(path_to_cookie=path_to_cookie, suspend=False, verbose=0)
+    if not main_suspend(path_to_cookie=path_to_cookie, suspend=False, verbose=0):
+        sys.exit(1)
 
     file_remove_if_exists(path_to_cookie)
 
@@ -1497,30 +1538,30 @@ def main_suspend(
     path_to_cookie: str = "",
     suspend: bool,
     verbose: int,
-) -> None:
+) -> bool:
+    """
+    Return False when nerd-dictation isn't running.
+    """
     import signal
 
     if not path_to_cookie:
         path_to_cookie = os.path.join(tempfile.gettempdir(), TEMP_COOKIE_NAME)
 
-    if not os.path.exists(path_to_cookie):
-        if verbose >= 1:
-            sys.stderr.write("No running nerd-dictation cookie found at: {:s}, abort!\n".format(path_to_cookie))
-        return
+    pid = cookie_running_pid(path_to_cookie)
+    if pid is not None:
+        try:
+            if suspend:
+                os.kill(pid, signal.SIGUSR1)
+            else:  # Resume.
+                os.kill(pid, signal.SIGCONT)
+            return True
+        except ProcessLookupError:
+            pass  # Exited since the check above.
 
-    with open(path_to_cookie, "r", encoding="utf-8") as fh:
-        data = fh.read()
-    try:
-        pid = int(data)
-    except Exception as ex:
-        if verbose >= 1:
-            sys.stderr.write("Failed to read PID with error {!r}, abort!\n".format(ex))
-        return
-
-    if suspend:
-        os.kill(pid, signal.SIGUSR1)
-    else:  # Resume.
-        os.kill(pid, signal.SIGCONT)
+    sys.stderr.write("nerd-dictation is not running\n")
+    if verbose >= 1:
+        sys.stderr.write("No running process found for cookie: {:s}\n".format(path_to_cookie))
+    return False
 
 
 def argparse_generic_command_cookie(subparse: argparse.ArgumentParser) -> None:
@@ -1924,7 +1965,8 @@ def argparse_create_suspend(subparsers: "argparse._SubParsersAction[argparse.Arg
             path_to_cookie=args.path_to_cookie,
             suspend=True,
             verbose=1,
-        ),
+        )
+        or sys.exit(1),
     )
 
 
@@ -1948,7 +1990,8 @@ def argparse_create_resume(subparsers: "argparse._SubParsersAction[argparse.Argu
             path_to_cookie=args.path_to_cookie,
             suspend=False,
             verbose=1,
-        ),
+        )
+        or sys.exit(1),
     )
 
 
