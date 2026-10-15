@@ -36,7 +36,10 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "tray.json")
 AUTOSTART_FILE = os.path.join(os.path.expanduser("~"), ".config", "autostart", APP_NAME + ".desktop")
 
 ICON_IDLE = "microphone-sensitivity-muted-symbolic"
-ICON_ACTIVE = "microphone-sensitivity-high-symbolic"
+# Green, glowing mic while dictating (XApp/GTK status icons accept a file path).
+ICON_ACTIVE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "icons", "mic-green.svg")
+if not os.path.isfile(ICON_ACTIVE):
+    ICON_ACTIVE = "microphone-sensitivity-high-symbolic"
 COOKIE_FILE = os.path.join(tempfile.gettempdir(), "nerd-dictation.cookie")
 
 
@@ -373,6 +376,10 @@ class TrayApp:
         self.config = load_config()
         self.python = find_vosk_python()
         self.proc = None
+        self.ready = False  # Our process has loaded its model and is listening.
+        self._stderr_buf = b""
+        self._stderr_tail = []
+        self._last_running = False
         self.bound = []
         self.settings_dialog = None
 
@@ -423,15 +430,24 @@ class TrayApp:
             self.icon.set_icon_name(name)
             self.icon.set_tooltip_text(tooltip)
         else:
-            self.icon.set_from_icon_name(name)
+            if os.path.isabs(name):
+                self.icon.set_from_file(name)
+            else:
+                self.icon.set_from_icon_name(name)
             self.icon.set_tooltip_text(tooltip)
 
     def update_state(self):
         running = self.is_running()
+        if self._last_running and not running:
+            # Played once the process has really finished (after typing the last words).
+            self._play("sound_end")
         self._last_running = running
         self.item_start.set_sensitive(not running)
         self.item_stop.set_sensitive(running)
-        if running:
+        own = self.proc is not None and self.proc.poll() is None
+        if running and own and not self.ready:
+            self._set_icon(ICON_IDLE, "Nerd Dictation: loading the speech model…")
+        elif running:
             self._set_icon(ICON_ACTIVE, "Nerd Dictation: listening ({:s} to stop)".format(
                 accel_label(self.config["shortcut_end"])))
         else:
@@ -458,18 +474,44 @@ class TrayApp:
         if not script or not os.path.isfile(script):
             self.error("Can't find the nerd-dictation script.\nSet its location in Settings.")
             return
-        cmd = [self.python, script, "begin", "--input=" + self.config["input"]]
+        # `--verbose=1` makes nerd-dictation report "Model loaded." once it's listening.
+        cmd = [self.python, script, "begin", "--verbose=1", "--input=" + self.config["input"]]
         model = self.config.get("model_dir")
         if model and os.path.isdir(model):
             cmd.append("--vosk-model-dir=" + model)
         try:
-            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
         except OSError as ex:
             self.error("Could not start nerd-dictation:\n" + str(ex))
             return
+        self.ready = False
+        self._stderr_buf = b""
+        self._stderr_tail = []
+        GLib.io_add_watch(self.proc.stderr.fileno(), GLib.PRIORITY_DEFAULT,
+                          GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._on_stderr, self.proc.stderr)
         GLib.child_watch_add(GLib.PRIORITY_DEFAULT, self.proc.pid, self._on_exit)
-        self._play("sound_begin")
         self.update_state()
+
+    def _on_stderr(self, fd, _condition, pipe):
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            data = b""
+        if not data:
+            pipe.close()
+            return False  # EOF: stop watching.
+        self._stderr_buf += data
+        *lines, self._stderr_buf = self._stderr_buf.split(b"\n")
+        for line in lines:
+            text = line.decode("utf-8", "replace").strip()
+            if not text:
+                continue
+            self._stderr_tail = (self._stderr_tail + [text])[-10:]
+            if text == "Model loaded." and not self.ready:
+                self.ready = True
+                self._play("sound_begin")
+                self.update_state()
+        return True
 
     def _play(self, key):
         if self.config.get("sounds"):
@@ -480,14 +522,15 @@ class TrayApp:
         if proc is not None:
             proc.wait()
             if proc.returncode not in (0, None, -signal.SIGTERM):
-                self.error("nerd-dictation exited with an error (code {:d}).\n"
-                           "Run it from a terminal to see details.".format(proc.returncode))
+                details = "\n".join(self._stderr_tail) or "Run it from a terminal to see details."
+                self.error("nerd-dictation exited with an error (code {:d}):\n\n{:s}".format(
+                    proc.returncode, details))
+        self.ready = False
         self.update_state()
 
     def end(self):
         if not self.is_running():
             return
-        self._play("sound_end")
         subprocess.call([self.python, self.config["nerd_dictation"], "end"])
 
     def toggle(self):
@@ -510,6 +553,10 @@ class TrayApp:
             accel = self.config.get(key)
             if not accel:
                 continue
+            # Normalize so "<Super><Alt>d" and "<Alt><Super>d" count as the same key.
+            keyval, mods = Gtk.accelerator_parse(accel)
+            if keyval:
+                accel = Gtk.accelerator_name(keyval, mods)
             if accel in self.bound:
                 # Same key for both: make it a toggle.
                 Keybinder.unbind(accel)
@@ -555,8 +602,29 @@ class TrayApp:
         Gtk.main_quit()
 
 
+def acquire_single_instance_lock():
+    """Return a held lock file, or None if another tray app is already running."""
+    import fcntl
+
+    lock_dir = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+    fh = open(os.path.join(lock_dir, APP_NAME + ".lock"), "w", encoding="utf-8")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    fh.write(str(os.getpid()))
+    fh.flush()
+    return fh
+
+
 def main():
     signal.signal(signal.SIGINT, signal.SIG_DFL)
+    # Held (not closed) for the life of the process; the OS releases it on exit.
+    lock = acquire_single_instance_lock()
+    if lock is None:
+        sys.stderr.write("nerd-dictation-tray is already running.\n")
+        sys.exit(0)
     if not os.path.exists(CONFIG_FILE):
         save_config(load_config())
     TrayApp()

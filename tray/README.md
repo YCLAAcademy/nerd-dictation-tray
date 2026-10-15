@@ -7,6 +7,7 @@ the offline VOSK-based voice typing tool for Linux.
 
 - **Right-click** the icon: Start dictation, Stop dictation, Settings…, Exit
 - **Left-click** the icon: toggle dictation on/off
+- The icon turns **green** while dictating, and a sound plays on start/stop
 - **Global shortcuts** (default `Super+Alt+D` to start, `Super+Alt+S` to stop)
 
 ## Requirements
