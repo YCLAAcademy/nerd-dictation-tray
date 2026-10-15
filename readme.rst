@@ -137,6 +137,18 @@ To test dictation:
 If you prefer to use a package, see: `Packaging <package/readme.rst>`_.
 
 
+Tray App
+========
+
+This fork includes a system tray icon for starting and stopping dictation,
+with configurable global shortcuts and a settings window.
+
+.. image:: tray/screenshot.png
+   :alt: Tray icon with its right-click menu
+
+Run ``tray/nerd-dictation-tray``, see: `Tray app <tray/README.md>`_.
+
+
 Configuration
 =============
 
