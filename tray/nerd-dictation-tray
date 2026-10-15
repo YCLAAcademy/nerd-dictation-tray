@@ -621,6 +621,7 @@ class TrayApp:
         self.config = load_config()
         self.python = find_vosk_python()
         self.proc = None
+        self.proc_engine = ""  # "Whisper" or "VOSK", the engine our dictation was started with.
         self.ready = False  # Our process has loaded its model and is listening.
         self._stderr_buf = b""
         self._stderr_tail = []
@@ -633,11 +634,17 @@ class TrayApp:
         self.item_start.connect("activate", lambda _w: self.begin())
         self.item_stop = Gtk.MenuItem(label="Stop dictation")
         self.item_stop.connect("activate", lambda _w: self.end())
+        # Quick switch between the speech engines, also in Settings ("Speech engine" tab).
+        self.item_whisper = Gtk.RadioMenuItem(label="Engine: Whisper")
+        self.item_vosk = Gtk.RadioMenuItem.new_with_label_from_widget(self.item_whisper, "Engine: VOSK")
+        self._sync_engine_items()
+        self.item_whisper.connect("toggled", self._on_engine_toggled)
         item_settings = Gtk.MenuItem(label="Settings…")
         item_settings.connect("activate", lambda _w: self.open_settings())
         item_exit = Gtk.MenuItem(label="Exit")
         item_exit.connect("activate", lambda _w: self.quit())
-        for item in (self.item_start, self.item_stop, Gtk.SeparatorMenuItem(), item_settings, item_exit):
+        for item in (self.item_start, self.item_stop, Gtk.SeparatorMenuItem(),
+                     self.item_whisper, self.item_vosk, Gtk.SeparatorMenuItem(), item_settings, item_exit):
             self.menu.append(item)
         self.menu.show_all()
 
@@ -693,8 +700,9 @@ class TrayApp:
         if running and own and not self.ready:
             self._set_icon(ICON_IDLE, "Nerd Dictation: loading the speech model…")
         elif running:
-            self._set_icon(ICON_ACTIVE, "Nerd Dictation: listening ({:s} to stop)".format(
-                accel_label(self.config["shortcut_end"])))
+            engine = " with " + self.proc_engine if own else ""
+            self._set_icon(ICON_ACTIVE, "Nerd Dictation: listening{:s} ({:s} to stop)".format(
+                engine, accel_label(self.config["shortcut_end"])))
         else:
             self._set_icon(ICON_IDLE, "Nerd Dictation: stopped ({:s} to start)".format(
                 accel_label(self.config["shortcut_begin"])))
@@ -721,6 +729,7 @@ class TrayApp:
             return
         # `--verbose=1` makes nerd-dictation report "Model loaded." once it's listening.
         cmd = [self.python, script, "begin", "--verbose=1", "--input=" + self.config["input"]]
+        self.proc_engine = "Whisper" if self.config.get("whisper_enabled") else "VOSK"
         if self.config.get("whisper_enabled"):
             cmd += [
                 "--engine=WHISPER",
@@ -802,6 +811,22 @@ class TrayApp:
         else:
             self.begin()
 
+    # ---- Speech engine ----
+
+    def _sync_engine_items(self):
+        item = self.item_whisper if self.config.get("whisper_enabled") else self.item_vosk
+        if not item.get_active():
+            item.set_active(True)
+
+    def _on_engine_toggled(self, _item):
+        whisper = self.item_whisper.get_active()
+        if whisper == bool(self.config.get("whisper_enabled")):
+            return
+        # Used from the next time dictation starts.
+        self.config["whisper_enabled"] = whisper
+        save_config(self.config)
+        self.update_state()
+
     # ---- Shortcuts ----
 
     def unbind_shortcuts(self):
@@ -854,6 +879,7 @@ class TrayApp:
         dialog.destroy()
         self.settings_dialog = None
         self.bind_shortcuts()
+        self._sync_engine_items()
         self.update_state()
 
     def error(self, message):
