@@ -85,13 +85,45 @@ def default_model_dir():
     return lgraph if os.path.isdir(lgraph) else ""
 
 
+def first_existing(*paths):
+    for path in paths:
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
 DEFAULT_CONFIG = {
     "nerd_dictation": find_nerd_dictation(),
     "shortcut_begin": "<Super><Alt>d",
     "shortcut_end": "<Super><Alt>s",
     "model_dir": default_model_dir(),
     "input": "PAREC",
+    "sounds": True,
+    "sound_begin": first_existing(
+        "/usr/share/sounds/LinuxMint/stereo/button-toggle-on.ogg",
+        "/usr/share/sounds/freedesktop/stereo/device-added.oga",
+    ),
+    "sound_end": first_existing(
+        "/usr/share/sounds/LinuxMint/stereo/button-toggle-off.ogg",
+        "/usr/share/sounds/freedesktop/stereo/device-removed.oga",
+    ),
 }
+
+
+def play_sound(path):
+    """Play a sound file without blocking, using whichever player is available."""
+    if not path or not os.path.isfile(path):
+        return
+    for player in ("paplay", "pw-play", "canberra-gtk-play"):
+        exe = shutil.which(player)
+        if not exe:
+            continue
+        cmd = [exe, "-f", path] if player == "canberra-gtk-play" else [exe, path]
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            continue
+        return
 
 
 def load_config():
@@ -265,11 +297,63 @@ class SettingsDialog(Gtk.Dialog):
         grid.attach(self.input_combo, 1, row, 1, 1)
         row += 1
 
+        grid.attach(Gtk.Separator(), 0, row, 2, 1)
+        row += 1
+
+        grid.attach(label("<b>Sounds</b>"), 0, row, 2, 1)
+        grid.get_child_at(0, row).set_use_markup(True)
+        row += 1
+
+        self.sounds_check = Gtk.CheckButton(label="Play a sound when dictation starts and stops")
+        self.sounds_check.set_active(cfg["sounds"])
+        grid.attach(self.sounds_check, 0, row, 2, 1)
+        row += 1
+
+        self.sound_begin_chooser = self._sound_chooser(cfg["sound_begin"])
+        grid.attach(label("Start sound:"), 0, row, 1, 1)
+        grid.attach(self._with_play_button(self.sound_begin_chooser), 1, row, 1, 1)
+        row += 1
+
+        self.sound_end_chooser = self._sound_chooser(cfg["sound_end"])
+        grid.attach(label("Stop sound:"), 0, row, 1, 1)
+        grid.attach(self._with_play_button(self.sound_end_chooser), 1, row, 1, 1)
+        row += 1
+
+        for widget in (self.sound_begin_chooser, self.sound_end_chooser):
+            self.sounds_check.bind_property("active", widget, "sensitive", 2)  # SYNC_CREATE
+
+        grid.attach(Gtk.Separator(), 0, row, 2, 1)
+        row += 1
+
         self.autostart_check = Gtk.CheckButton(label="Start this tray app when I log in")
         self.autostart_check.set_active(autostart_enabled())
         grid.attach(self.autostart_check, 0, row, 2, 1)
 
         self.show_all()
+
+    @staticmethod
+    def _sound_chooser(path):
+        chooser = Gtk.FileChooserButton(title="Choose a sound", action=Gtk.FileChooserAction.OPEN)
+        sound_filter = Gtk.FileFilter()
+        sound_filter.set_name("Sounds")
+        for pattern in ("*.oga", "*.ogg", "*.wav", "*.flac", "*.mp3"):
+            sound_filter.add_pattern(pattern)
+        chooser.add_filter(sound_filter)
+        if path and os.path.isfile(path):
+            chooser.set_filename(path)
+        else:
+            chooser.set_current_folder("/usr/share/sounds")
+        return chooser
+
+    @staticmethod
+    def _with_play_button(chooser):
+        box = Gtk.Box(spacing=6)
+        box.pack_start(chooser, True, True, 0)
+        play = Gtk.Button.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON)
+        play.set_tooltip_text("Preview")
+        play.connect("clicked", lambda _b: play_sound(chooser.get_filename()))
+        box.pack_start(play, False, False, 0)
+        return box
 
     def collect(self):
         return {
@@ -278,6 +362,9 @@ class SettingsDialog(Gtk.Dialog):
             "shortcut_end": self.end_btn.accel,
             "model_dir": self.model_chooser.get_filename() or "",
             "input": self.input_combo.get_active_id() or "PAREC",
+            "sounds": self.sounds_check.get_active(),
+            "sound_begin": self.sound_begin_chooser.get_filename() or "",
+            "sound_end": self.sound_end_chooser.get_filename() or "",
         }
 
 
@@ -381,7 +468,12 @@ class TrayApp:
             self.error("Could not start nerd-dictation:\n" + str(ex))
             return
         GLib.child_watch_add(GLib.PRIORITY_DEFAULT, self.proc.pid, self._on_exit)
+        self._play("sound_begin")
         self.update_state()
+
+    def _play(self, key):
+        if self.config.get("sounds"):
+            play_sound(self.config.get(key))
 
     def _on_exit(self, _pid, status):
         proc, self.proc = self.proc, None
@@ -395,6 +487,7 @@ class TrayApp:
     def end(self):
         if not self.is_running():
             return
+        self._play("sound_end")
         subprocess.call([self.python, self.config["nerd_dictation"], "end"])
 
     def toggle(self):
