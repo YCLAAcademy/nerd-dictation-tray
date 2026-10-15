@@ -1,0 +1,448 @@
+#!/usr/bin/python3
+"""
+System tray app for nerd-dictation.
+
+Right-click the tray icon for Start / Stop / Settings / Exit.
+Global keyboard shortcuts for begin/end can be set in Settings (X11 only).
+
+Uses the system Python (for GTK bindings) to run the tray, and runs
+nerd-dictation itself with the Python interpreter that has `vosk` installed.
+"""
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Keybinder", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Keybinder  # noqa: E402
+
+try:
+    gi.require_version("XApp", "1.0")
+    from gi.repository import XApp  # noqa: E402
+except (ValueError, ImportError):
+    XApp = None
+
+APP_NAME = "nerd-dictation-tray"
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "nerd-dictation")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "tray.json")
+AUTOSTART_FILE = os.path.join(os.path.expanduser("~"), ".config", "autostart", APP_NAME + ".desktop")
+
+ICON_IDLE = "microphone-sensitivity-muted-symbolic"
+ICON_ACTIVE = "microphone-sensitivity-high-symbolic"
+
+
+def find_vosk_python():
+    # Prefer an interpreter that can `import vosk`.
+    candidates = ["/usr/local/bin/python3", shutil.which("python3"), sys.executable]
+    for exe in candidates:
+        if not exe or not os.path.exists(exe):
+            continue
+        if subprocess.call([exe, "-c", "import vosk"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+            return exe
+    return "python3"
+
+
+def find_nerd_dictation():
+    # In the parent checkout (this app lives in `tray/`), on PATH, or next to this app.
+    here = os.path.dirname(os.path.realpath(__file__))
+    candidates = [
+        os.path.join(os.path.dirname(here), "nerd-dictation"),
+        shutil.which("nerd-dictation"),
+        os.path.join(here, "nerd-dictation"),
+        os.path.join(os.path.dirname(here), "nerd-dictation", "nerd-dictation"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    return ""
+
+
+def default_model_dir():
+    lgraph = os.path.join(CONFIG_DIR, "vosk-model-en-us-0.22-lgraph")
+    return lgraph if os.path.isdir(lgraph) else ""
+
+
+DEFAULT_CONFIG = {
+    "nerd_dictation": find_nerd_dictation(),
+    "shortcut_begin": "<Super><Alt>d",
+    "shortcut_end": "<Super><Alt>s",
+    "model_dir": default_model_dir(),
+    "input": "PAREC",
+}
+
+
+def load_config():
+    config = dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as fh:
+            config.update(json.load(fh))
+    except (OSError, ValueError):
+        pass
+    return config
+
+
+def save_config(config):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w", encoding="utf-8") as fh:
+        json.dump(config, fh, indent=2)
+
+
+def autostart_enabled():
+    return os.path.exists(AUTOSTART_FILE)
+
+
+def set_autostart(enabled):
+    if enabled:
+        os.makedirs(os.path.dirname(AUTOSTART_FILE), exist_ok=True)
+        with open(AUTOSTART_FILE, "w", encoding="utf-8") as fh:
+            fh.write(
+                "[Desktop Entry]\n"
+                "Type=Application\n"
+                "Name=Nerd Dictation\n"
+                "Exec={:s}\n"
+                "Icon=audio-input-microphone\n"
+                "X-GNOME-Autostart-enabled=true\n".format(os.path.realpath(__file__))
+            )
+    elif os.path.exists(AUTOSTART_FILE):
+        os.remove(AUTOSTART_FILE)
+
+
+def accel_label(accel):
+    if not accel:
+        return "Not set"
+    key, mods = Gtk.accelerator_parse(accel)
+    return Gtk.accelerator_get_label(key, mods) if key else accel
+
+
+class ShortcutButton(Gtk.Button):
+    """A button that records a key combination when clicked."""
+
+    def __init__(self, accel, on_capture_start, on_capture_end):
+        super().__init__()
+        self.accel = accel
+        self._on_capture_start = on_capture_start
+        self._on_capture_end = on_capture_end
+        self._capturing = False
+        self._handler = None
+        self.set_label(accel_label(accel))
+        self.connect("clicked", self._start_capture)
+
+    def _start_capture(self, _button):
+        if self._capturing:
+            return
+        self._capturing = True
+        self._on_capture_start()
+        self.set_label("Press keys… (Esc cancel, Backspace clear)")
+        self._handler = self.get_toplevel().connect("key-press-event", self._on_key)
+
+    def _finish(self):
+        self._capturing = False
+        self.get_toplevel().disconnect(self._handler)
+        self.set_label(accel_label(self.accel))
+        self._on_capture_end()
+
+    def _on_key(self, _widget, event):
+        keyval = Gdk.keyval_to_lower(event.keyval)
+        mods = event.state & Gtk.accelerator_get_default_mod_mask()
+        if keyval == Gdk.KEY_Escape and not mods:
+            self._finish()
+            return True
+        if keyval == Gdk.KEY_BackSpace and not mods:
+            self.accel = ""
+            self._finish()
+            return True
+        # Ignore lone modifier presses, wait for the real key.
+        if event.is_modifier:
+            return True
+        if not Gtk.accelerator_valid(keyval, mods):
+            return True
+        self.accel = Gtk.accelerator_name(keyval, mods)
+        self._finish()
+        return True
+
+
+class SettingsDialog(Gtk.Dialog):
+    def __init__(self, app):
+        super().__init__(title="Nerd Dictation Settings", flags=0)
+        self.app = app
+        self.set_default_size(460, -1)
+        self.set_icon_name("audio-input-microphone")
+        self.add_button("Cancel", Gtk.ResponseType.CANCEL)
+        self.add_button("Save", Gtk.ResponseType.OK)
+        self.set_default_response(Gtk.ResponseType.OK)
+
+        cfg = app.config
+        grid = Gtk.Grid(column_spacing=12, row_spacing=10, margin=16)
+        self.get_content_area().add(grid)
+
+        row = 0
+
+        def label(text):
+            lbl = Gtk.Label(label=text, xalign=0)
+            return lbl
+
+        grid.attach(label("<b>Keyboard shortcuts</b>"), 0, row, 2, 1)
+        grid.get_child_at(0, row).set_use_markup(True)
+        row += 1
+
+        self.begin_btn = ShortcutButton(cfg["shortcut_begin"], app.unbind_shortcuts, lambda: None)
+        self.begin_btn.set_hexpand(True)
+        grid.attach(label("Start dictation:"), 0, row, 1, 1)
+        grid.attach(self.begin_btn, 1, row, 1, 1)
+        row += 1
+
+        self.end_btn = ShortcutButton(cfg["shortcut_end"], app.unbind_shortcuts, lambda: None)
+        grid.attach(label("Stop dictation:"), 0, row, 1, 1)
+        grid.attach(self.end_btn, 1, row, 1, 1)
+        row += 1
+
+        hint = label("Click a button, then press the key combination.")
+        hint.get_style_context().add_class("dim-label")
+        grid.attach(hint, 0, row, 2, 1)
+        row += 1
+
+        grid.attach(Gtk.Separator(), 0, row, 2, 1)
+        row += 1
+
+        grid.attach(label("<b>Dictation</b>"), 0, row, 2, 1)
+        grid.get_child_at(0, row).set_use_markup(True)
+        row += 1
+
+        self.script_chooser = Gtk.FileChooserButton(
+            title="Choose the nerd-dictation script", action=Gtk.FileChooserAction.OPEN
+        )
+        if cfg["nerd_dictation"] and os.path.isfile(cfg["nerd_dictation"]):
+            self.script_chooser.set_filename(cfg["nerd_dictation"])
+        grid.attach(label("nerd-dictation:"), 0, row, 1, 1)
+        grid.attach(self.script_chooser, 1, row, 1, 1)
+        row += 1
+
+        self.model_chooser = Gtk.FileChooserButton(
+            title="Choose a VOSK model folder", action=Gtk.FileChooserAction.SELECT_FOLDER
+        )
+        if cfg["model_dir"] and os.path.isdir(cfg["model_dir"]):
+            self.model_chooser.set_filename(cfg["model_dir"])
+        else:
+            self.model_chooser.set_current_folder(CONFIG_DIR)
+        model_box = Gtk.Box(spacing=6)
+        model_box.pack_start(self.model_chooser, True, True, 0)
+        reset_btn = Gtk.Button.new_from_icon_name("edit-clear-symbolic", Gtk.IconSize.BUTTON)
+        reset_btn.set_tooltip_text("Use the default model (~/.config/nerd-dictation/model)")
+        reset_btn.connect("clicked", lambda _b: self.model_chooser.unselect_all())
+        model_box.pack_start(reset_btn, False, False, 0)
+        grid.attach(label("Model folder:"), 0, row, 1, 1)
+        grid.attach(model_box, 1, row, 1, 1)
+        row += 1
+
+        self.input_combo = Gtk.ComboBoxText()
+        for value in ("PAREC", "PW-CAT", "SOX"):
+            self.input_combo.append(value, value.lower())
+        self.input_combo.set_active_id(cfg["input"])
+        grid.attach(label("Audio input:"), 0, row, 1, 1)
+        grid.attach(self.input_combo, 1, row, 1, 1)
+        row += 1
+
+        self.autostart_check = Gtk.CheckButton(label="Start this tray app when I log in")
+        self.autostart_check.set_active(autostart_enabled())
+        grid.attach(self.autostart_check, 0, row, 2, 1)
+
+        self.show_all()
+
+    def collect(self):
+        return {
+            "nerd_dictation": self.script_chooser.get_filename() or self.app.config["nerd_dictation"],
+            "shortcut_begin": self.begin_btn.accel,
+            "shortcut_end": self.end_btn.accel,
+            "model_dir": self.model_chooser.get_filename() or "",
+            "input": self.input_combo.get_active_id() or "PAREC",
+        }
+
+
+class TrayApp:
+    def __init__(self):
+        self.config = load_config()
+        self.python = find_vosk_python()
+        self.proc = None
+        self.bound = []
+        self.settings_dialog = None
+
+        self.menu = Gtk.Menu()
+        self.item_start = Gtk.MenuItem(label="Start dictation")
+        self.item_start.connect("activate", lambda _w: self.begin())
+        self.item_stop = Gtk.MenuItem(label="Stop dictation")
+        self.item_stop.connect("activate", lambda _w: self.end())
+        item_settings = Gtk.MenuItem(label="Settings…")
+        item_settings.connect("activate", lambda _w: self.open_settings())
+        item_exit = Gtk.MenuItem(label="Exit")
+        item_exit.connect("activate", lambda _w: self.quit())
+        for item in (self.item_start, self.item_stop, Gtk.SeparatorMenuItem(), item_settings, item_exit):
+            self.menu.append(item)
+        self.menu.show_all()
+
+        self._create_icon()
+        Keybinder.init()
+        self.bind_shortcuts()
+        self.update_state()
+
+    # ---- Tray icon ----
+
+    def _create_icon(self):
+        if XApp is not None:
+            # Native Cinnamon/MATE/Xfce status icon: right-click menu, left-click toggles.
+            self.icon = XApp.StatusIcon()
+            self.icon.set_name(APP_NAME)
+            self.icon.set_secondary_menu(self.menu)
+            self.icon.connect("activate", self._on_left_click)
+            self.kind = "xapp"
+        else:
+            self.icon = Gtk.StatusIcon()
+            self.icon.connect("popup-menu", self._on_gtk_popup)
+            self.icon.connect("activate", lambda _i: self.toggle())
+            self.kind = "gtk"
+
+    def _on_left_click(self, _icon, button, _time):
+        if button == 1:
+            self.toggle()
+
+    def _on_gtk_popup(self, icon, button, time):
+        self.menu.popup(None, None, Gtk.StatusIcon.position_menu, icon, button, time)
+
+    def _set_icon(self, name, tooltip):
+        if self.kind == "xapp":
+            self.icon.set_icon_name(name)
+            self.icon.set_tooltip_text(tooltip)
+        else:
+            self.icon.set_from_icon_name(name)
+            self.icon.set_tooltip_text(tooltip)
+
+    def update_state(self):
+        running = self.is_running()
+        self.item_start.set_sensitive(not running)
+        self.item_stop.set_sensitive(running)
+        if running:
+            self._set_icon(ICON_ACTIVE, "Nerd Dictation: listening ({:s} to stop)".format(
+                accel_label(self.config["shortcut_end"])))
+        else:
+            self._set_icon(ICON_IDLE, "Nerd Dictation: stopped ({:s} to start)".format(
+                accel_label(self.config["shortcut_begin"])))
+
+    # ---- Dictation control ----
+
+    def is_running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def begin(self):
+        if self.is_running():
+            return
+        script = self.config.get("nerd_dictation")
+        if not script or not os.path.isfile(script):
+            self.error("Can't find the nerd-dictation script.\nSet its location in Settings.")
+            return
+        cmd = [self.python, script, "begin", "--input=" + self.config["input"]]
+        model = self.config.get("model_dir")
+        if model and os.path.isdir(model):
+            cmd.append("--vosk-model-dir=" + model)
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+        except OSError as ex:
+            self.error("Could not start nerd-dictation:\n" + str(ex))
+            return
+        GLib.child_watch_add(GLib.PRIORITY_DEFAULT, self.proc.pid, self._on_exit)
+        self.update_state()
+
+    def _on_exit(self, _pid, status):
+        proc, self.proc = self.proc, None
+        if proc is not None:
+            proc.wait()
+            if proc.returncode not in (0, None, -signal.SIGTERM):
+                self.error("nerd-dictation exited with an error (code {:d}).\n"
+                           "Run it from a terminal to see details.".format(proc.returncode))
+        self.update_state()
+
+    def end(self):
+        if not self.is_running():
+            return
+        subprocess.call([self.python, self.config["nerd_dictation"], "end"])
+
+    def toggle(self):
+        if self.is_running():
+            self.end()
+        else:
+            self.begin()
+
+    # ---- Shortcuts ----
+
+    def unbind_shortcuts(self):
+        for accel in self.bound:
+            Keybinder.unbind(accel)
+        self.bound = []
+
+    def bind_shortcuts(self):
+        self.unbind_shortcuts()
+        failed = []
+        for key, handler in (("shortcut_begin", self.begin), ("shortcut_end", self.end)):
+            accel = self.config.get(key)
+            if not accel:
+                continue
+            if accel in self.bound:
+                # Same key for both: make it a toggle.
+                Keybinder.unbind(accel)
+                self.bound.remove(accel)
+                handler = self.toggle
+            if Keybinder.bind(accel, lambda _keystr, h=handler: GLib.idle_add(h)):
+                self.bound.append(accel)
+            else:
+                failed.append(accel_label(accel))
+        if failed:
+            self.error("Could not register shortcut(s): {:s}\n"
+                       "They may already be used by another app.".format(", ".join(failed)))
+
+    # ---- Settings / misc ----
+
+    def open_settings(self):
+        if self.settings_dialog is not None:
+            self.settings_dialog.present()
+            return
+        dialog = SettingsDialog(self)
+        self.settings_dialog = dialog
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            self.config.update(dialog.collect())
+            save_config(self.config)
+            set_autostart(dialog.autostart_check.get_active())
+        dialog.destroy()
+        self.settings_dialog = None
+        self.bind_shortcuts()
+        self.update_state()
+
+    def error(self, message):
+        dialog = Gtk.MessageDialog(
+            message_type=Gtk.MessageType.ERROR, buttons=Gtk.ButtonsType.OK, text="Nerd Dictation")
+        dialog.format_secondary_text(message)
+        dialog.run()
+        dialog.destroy()
+
+    def quit(self):
+        if self.is_running():
+            self.end()
+        self.unbind_shortcuts()
+        Gtk.main_quit()
+
+
+def main():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    if not os.path.exists(CONFIG_FILE):
+        save_config(load_config())
+    TrayApp()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
